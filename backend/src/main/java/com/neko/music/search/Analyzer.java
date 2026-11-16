@@ -30,9 +30,27 @@ public final class Analyzer {
 
     /**
      * 分析器语义版本；任何影响词元输出的变更都必须递增（触发全量重建）。
-     * 采用 analyzer v12：数据表结构与算法版本固定。
+     *
+     * <p>v14：CJK 段只保留首尾 unigram（见 {@link #KEEP_CJK_EDGE_UNIGRAMS}），
+     * 索引内容变化，必须重建。
      */
-    public static final int ANALYZER_VERSION = 12;
+    public static final int ANALYZER_VERSION = 14;
+
+    /**
+     * CJK 段是否只保留首尾 unigram（中间字由 bigram 覆盖）。
+     *
+     * <p>单字在真实曲库里的文档频率极高（常见字可覆盖全库四成以上），
+     * 「歌词含某个字」几乎不构成检索意图，却是单字查询扫全库的结构性根源。
+     * 去掉中间字的 unigram 后，单字查询改走前缀 {@code 字*}，
+     * 命中范围由「以该字开头的 bigram」决定。
+     *
+     * <p>必须保留首尾：末字只作为某个 bigram 的第二个字符存在，
+     * 若不留 unigram 将彻底查不到；首字则保证段首检索不受影响。
+     *
+     * <p>回退方式：改为 {@code false} 并把 {@link #ANALYZER_VERSION} 降回 13，
+     * 然后全量重建索引。
+     */
+    public static final boolean KEEP_CJK_EDGE_UNIGRAMS = true;
 
     /** 查询侧跨语言候选合并去重后的总预算。 */
     public static final int CROSS_LINGUAL_BUDGET = 32;
@@ -65,6 +83,7 @@ public final class Analyzer {
         private final List<String> pinyin = new ArrayList<>();
         private final List<String> crossLingual = new ArrayList<>();
         private String pinyinInitials;
+        private boolean hasCjk;
 
         public List<String> lexical() {
             return lexical;
@@ -81,6 +100,11 @@ public final class Analyzer {
 
         public List<String> crossLingual() {
             return crossLingual;
+        }
+
+        /** 查询是否含 CJK 段（汉字 / 假名 / 谚文）；用于读音支的脚本分流。 */
+        public boolean hasCjk() {
+            return hasCjk;
         }
     }
 
@@ -132,6 +156,7 @@ public final class Analyzer {
         }
 
         query.pinyinInitials = parts.hasCjk ? String.join(" ", parts.initials) : null;
+        query.hasCjk = parts.hasCjk;
         query.crossLingual().addAll(collectCrossLingual(text));
         removePinyinCollisions(query);
         return query;
@@ -225,15 +250,25 @@ public final class Analyzer {
         return parts;
     }
 
-    /** CJK 段：bigram 在前（短语连续）、unigram 在后；拼音整段词级消歧；首字母合并为一个 token。 */
+    /**
+     * CJK 段：bigram + 首尾 unigram（中间字由 bigram 覆盖）；拼音整段词级消歧；
+     * 首字母合并为一个 token。单字段落整段即首尾。
+     */
     private static void addCjkSegment(String segment, Parts parts) {
         if (segment.length() >= 2) {
             for (int i = 0; i + 1 < segment.length(); i++) {
                 parts.tokens.add(segment.substring(i, i + 2));
             }
-        }
-        for (int i = 0; i < segment.length(); i++) {
-            parts.tokens.add(String.valueOf(segment.charAt(i)));
+            if (KEEP_CJK_EDGE_UNIGRAMS) {
+                parts.tokens.add(segment.substring(0, 1));
+                parts.tokens.add(segment.substring(segment.length() - 1));
+            } else {
+                for (int i = 0; i < segment.length(); i++) {
+                    parts.tokens.add(String.valueOf(segment.charAt(i)));
+                }
+            }
+        } else if (segment.length() == 1) {
+            parts.tokens.add(segment);
         }
 
         parts.pinyin.addAll(PinyinFacade.fromCjkRun(segment));

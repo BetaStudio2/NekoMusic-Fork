@@ -63,11 +63,17 @@ public final class FtsStore implements AutoCloseable {
                     + "pinyin_meta_tok, pinyin_lyrics_tok, reading_meta_tok, "
                     + "filename_tok, initials_meta_tok, initials_lyrics_tok";
 
-    /** bm25 权重，顺序与 {@link #FTS_COLUMNS} 严格一致。 */
+    /**
+     * bm25 权重，顺序与 {@link #FTS_COLUMNS} 严格一致。
+     *
+     * <p>歌词列（原文 / 拼音 / 首字母）取低权重：歌词的文档频率天然偏高，
+     * 且长文本的单曲内重复会进一步放大词频，容易让「歌词里恰好出现」压过
+     * 「歌名就是它」。取非零值是为了保留「搜歌词找歌」这一真实用法。
+     */
     private static final double[] BM25_WEIGHTS = {
-            4.0, 3.0, 2.0, 1.5, 1.0, 0.5,
-            2.0, 1.5, 2.0,
-            1.0, 2.0, 1.5,
+            4.0, 3.0, 2.0, 0.6, 1.0, 0.5,
+            2.0, 0.5, 2.0,
+            1.0, 2.0, 0.5,
     };
 
     /** 候选集上限（历史参数；0 = 不限）。排序一律走含 MATCH 的全命中 bm25。 */
@@ -351,6 +357,32 @@ public final class FtsStore implements AutoCloseable {
     }
 
     public record ScoredDoc(long docId, double score) {
+    }
+
+    /**
+     * 统计某个 MATCH 表达式命中的文档数（只走计数路径，不排序、不取行）。
+     *
+     * <p>表达式由调用方保证已转义；语法错误按 0 处理，让调用方退回默认策略，
+     * 而不是让整次搜索失败。
+     */
+    public synchronized int countMatches(String matchExpr) {
+        if (matchExpr == null || matchExpr.isBlank()) {
+            return 0;
+        }
+        ensureOpen();
+        try {
+            commitTx();
+            String sql = "SELECT COUNT(*) FROM search_fts WHERE search_fts MATCH ?";
+            try (PreparedStatement cmd = connection.prepareStatement(sql)) {
+                cmd.setString(1, matchExpr);
+                try (ResultSet reader = cmd.executeQuery()) {
+                    return reader.next() ? reader.getInt(1) : 0;
+                }
+            }
+        } catch (SQLException e) {
+            logger.debug("MATCH 计数失败，按 0 处理: {}", e.getMessage());
+            return 0;
+        }
     }
 
     /** 批量把 doc_id 映射回 track_id。 */

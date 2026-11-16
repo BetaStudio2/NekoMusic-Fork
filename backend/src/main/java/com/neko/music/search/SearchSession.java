@@ -88,12 +88,27 @@ public final class SearchSession implements AutoCloseable {
         }
     }
 
-    /** 单条命中（bm25 分数越小越相关）。 */
-    public record SearchHit(String trackId, double score) {
+    /** 命中趟次名，用于归因「这条结果由哪一趟召回」。 */
+    public static final class PassNames {
+        public static final String LEXICAL = "lexical";
+        public static final String DROP_TOKENS = "dropTokens";
+        public static final String PINYIN_LOOSE = "pinyinLoose";
+        public static final String READING = "reading";
+        public static final String CROSS_LINGUAL = "crossLingual";
+        public static final String FUZZY = "fuzzy";
+        public static final String CJK_FUZZY = "cjkFuzzy";
+
+        private PassNames() {
+        }
+    }
+
+    /** 单条命中（bm25 分数越小越相关）。{@code pass} 为命中原由归因。 */
+    public record SearchHit(String trackId, double score, String pass) {
     }
 
     /** 本次查询实际执行的兜底趟（用于诊断与回归计数）。 */
     public static final class PassCounts {
+        public int dropTokens;
         public int pinyinLoose;
         public int reading;
         public int crossLingual;
@@ -240,20 +255,45 @@ public final class SearchSession implements AutoCloseable {
         final FtsStore.StoreMeta profile = meta;
 
         // 主趟：精确表达式（词法 / 拼音 / 首字母）。
-        merge(result, seen, SearchQuery.compileMatch(tokens, request.metadata(), false), null, request);
+        merge(result, seen, SearchQuery.compileMatch(tokens, request.metadata(), false),
+                PassNames.LEXICAL, null, request);
+
+        // 丢词降级：多词查询主趟不足时，先试「少匹配一个词」，而不是直接换读音维度。
+        // 减词仍是字面匹配；逐轮尝试，命中达标即停。
+        if (result.items().size() < request.minExact() && SearchQuery.ALLOW_DROP_TOKENS) {
+            List<Integer> candidates = SearchQuery.dropTokenCandidates(tokens, request.query());
+            if (!candidates.isEmpty()) {
+                FieldCounts counts = probeFieldAffinity(request.query(), candidates.size());
+                candidates = SearchQuery.orderDropsByFieldAffinity(
+                        candidates, counts.title(), counts.artist());
+            }
+            for (int dropIndex : candidates) {
+                String dropped = SearchQuery.compileDropTokens(
+                        tokens, request.query(), request.metadata(), dropIndex);
+                if (dropped == null) {
+                    continue;
+                }
+                result.passes().dropTokens = 1;
+                merge(result, seen, dropped, PassNames.DROP_TOKENS, null, request);
+                if (result.items().size() >= request.minExact()) {
+                    break;
+                }
+            }
+        }
 
         if (result.items().size() < request.minExact()) {
             String expression = SearchQuery.compilePinyinLoose(tokens, request.metadata());
             if (expression != null) {
                 result.passes().pinyinLoose = 1;
-                merge(result, seen, expression, null, request);
+                merge(result, seen, expression, PassNames.PINYIN_LOOSE, null, request);
             }
         }
         if (result.items().size() < request.minExact() && (profile.hasJapanese || profile.hasKorean)) {
             String expression = SearchQuery.compileReading(tokens, request.metadata());
             if (expression != null) {
                 result.passes().reading = 1;
-                merge(result, seen, expression, SearchQuery.readingSequences(tokens), request);
+                merge(result, seen, expression, PassNames.READING,
+                        SearchQuery.readingSequences(tokens), request);
             }
         }
         if (result.items().size() < request.minExact()) {
@@ -264,7 +304,7 @@ public final class SearchSession implements AutoCloseable {
                 String expression = SearchQuery.compileCrossLingual(tokens, request.metadata());
                 if (expression != null) {
                     result.passes().crossLingual = 1;
-                    merge(result, seen, expression, null, request);
+                    merge(result, seen, expression, PassNames.CROSS_LINGUAL, null, request);
                 }
             }
         }
@@ -278,7 +318,7 @@ public final class SearchSession implements AutoCloseable {
             merge(result, seen,
                     SearchQuery.compileFuzzy(tokens, request.metadata(),
                             store.loadFuzzyVocabulary(), SearchQuery.DEFAULT_MAX_FUZZY_VARIANTS),
-                    null, request);
+                    PassNames.FUZZY, null, request);
         }
         if (result.items().size() >= request.minExact()) {
             return result;
@@ -301,9 +341,39 @@ public final class SearchSession implements AutoCloseable {
             String joined = parts.size() == 1 ? parts.get(0) : "(" + String.join(" OR ", parts) + ")";
             merge(result, seen,
                     request.metadata() ? "{" + SearchQuery.METADATA_COLUMNS + "} : (" + joined + ")" : joined,
-                    null, request);
+                    PassNames.CJK_FUZZY, null, request);
         }
         return result;
+    }
+
+    /**
+     * 探测每个查询词在 title / artist 列的命中数，用于判断「哪个词是歌名」。
+     * 只在主趟不足的多词查询上执行，每词两次计数查询。
+     */
+    private FieldCounts probeFieldAffinity(String query, int wordCount) {
+        List<Integer> title = new ArrayList<>(wordCount);
+        List<Integer> artist = new ArrayList<>(wordCount);
+        String[] words = query == null || query.isBlank() ? new String[0] : query.trim().split("\\s+");
+        for (int i = 0; i < wordCount; i++) {
+            if (i >= words.length || words[i].isEmpty()) {
+                title.add(0);
+                artist.add(0);
+                continue;
+            }
+            Analyzer.QueryTokens tokens = Analyzer.analyzeQuery(words[i]);
+            String lexical = SearchQuery.compileMatch(tokens, false, false);
+            if (lexical == null) {
+                title.add(0);
+                artist.add(0);
+                continue;
+            }
+            title.add(store.countMatches("{title_tok} : (" + lexical + ")"));
+            artist.add(store.countMatches("{artist_tok} : (" + lexical + ")"));
+        }
+        return new FieldCounts(title, artist);
+    }
+
+    private record FieldCounts(List<Integer> title, List<Integer> artist) {
     }
 
     /**
@@ -328,19 +398,19 @@ public final class SearchSession implements AutoCloseable {
         return output;
     }
 
-    private void merge(SearchResult result, Set<String> seen, String expression,
+    private void merge(SearchResult result, Set<String> seen, String expression, String pass,
                        List<String[]> readingSequences, SearchRequest request) {
         if (expression == null) {
             return;
         }
-        for (SearchHit hit : executeMatch(expression, request, readingSequences)) {
+        for (SearchHit hit : executeMatch(expression, request, pass, readingSequences)) {
             if (seen.add(hit.trackId())) {
                 result.items().add(hit);
             }
         }
     }
 
-    private List<SearchHit> executeMatch(String expression, SearchRequest request,
+    private List<SearchHit> executeMatch(String expression, SearchRequest request, String pass,
                                          List<String[]> readingSequences) {
         List<FtsStore.ScoredDoc> rows;
         try {
@@ -370,7 +440,7 @@ public final class SearchSession implements AutoCloseable {
             for (FtsStore.ScoredDoc row : rows) {
                 String trackId = trackIds.get(row.docId());
                 if (trackId != null) {
-                    plain.add(new SearchHit(trackId, row.score()));
+                    plain.add(new SearchHit(trackId, row.score(), pass));
                 }
             }
             return plain;
@@ -393,7 +463,7 @@ public final class SearchSession implements AutoCloseable {
             }
             String text = readings.get(row.docId());
             int tier = text != null ? ReadingRanker.score(text, readingSequences) : ReadingRanker.OTHER_TIER;
-            ranked.add(new Ranked(new SearchHit(trackId, row.score()), tier));
+            ranked.add(new Ranked(new SearchHit(trackId, row.score(), pass), tier));
         }
         ranked.sort((a, b) -> {
             if (a.tier() != b.tier()) {
